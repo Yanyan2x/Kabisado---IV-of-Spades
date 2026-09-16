@@ -1,0 +1,965 @@
+
+import sys
+import time
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+import pygame
+
+
+# ==========================================================
+# SONG
+# ==========================================================
+
+SONG_PATH = "kabisado.mp3"
+
+# IMPORTANT:
+# This must be a path to a LOCAL audio file on disk.
+# pygame.mixer cannot stream from a remote URL directly -
+# if you only have a URL, download the file first.
+
+
+
+# ==========================================================
+# LYRICS
+# ==========================================================
+#
+# FORMAT:
+#
+# (TYPE_SPEED, SPAWN_TIME, "LYRIC", RISE_SPEED)
+#
+# TYPE_SPEED:
+# 0.05 = very fast
+# 0.10 = normal
+# 0.15 = slower
+# 0.20 = very slow
+#
+# SPAWN_TIME:
+# Time in seconds when the note appears.
+#
+# RISE_SPEED (optional):
+# Pixels per animation tick that THIS card moves upward.
+# 1  = very slow drift
+# 2  = normal (matches the old global NOTE_SPEED)
+# 4  = fast
+# 6+ = very fast
+# If omitted, DEFAULT_NOTE_SPEED below is used.
+#
+# ==========================================================
+
+LYRICS = [
+    (0.17, 2, " Nang magpaulan ang panginoon ng kagandahan....", 1.3),
+    (0.10, 12, "Nabuhos lahat sa iyo.....", 2),
+    (0.22, 18, "Ohh parang di ka totoo.....", 2),
+    (0.16, 25, "Kabisado ko na ang tamis ng iyong labi", 1.5),
+    (0.14, 33, "Kabisado ko na ang oras ng iyong uwi", 1.5),
+    (0.12, 39, "Di na kailangan pa....", 1.5),
+    (0.15, 41, "Na ikaw ay magsalita....", 1.5),
+]
+
+
+# ==========================================================
+# NOTE SETTINGS
+# ==========================================================
+
+NOTE_WIDTH = 300
+NOTE_HEIGHT = 300
+
+# How fast the cards move upward, used when a lyric doesn't
+# specify its own RISE_SPEED
+DEFAULT_NOTE_SPEED = 2
+
+# Animation refresh
+ANIM_INTERVAL_MS = 15
+
+# How often the program checks the lyric timestamps
+LYRIC_CHECK_MS = 20
+
+# Rounded corner size
+CORNER_RADIUS = 0
+
+# Distance from left/right edge
+SIDE_MARGIN = 300
+
+# Gap between cards on the same side
+NOTE_GAP = 40
+
+
+# ==========================================================
+# AUDIO PLAYER (pygame-based, replaces QMediaPlayer)
+# ==========================================================
+
+class AudioPlayer:
+    """
+    Small wrapper around pygame.mixer.music that mimics just the
+    bits of QMediaPlayer this script needs: play(), stop(),
+    a "position in seconds" getter, and a "finished" check.
+    """
+
+    def __init__(self, path):
+
+        pygame.mixer.init()
+
+        self.path = path
+
+        self._play_start_time = None
+        self._paused_position = 0.0
+        self._loaded_ok = False
+
+        try:
+            pygame.mixer.music.load(self.path)
+            self._loaded_ok = True
+        except pygame.error as e:
+            print(f"[audio] Could not load '{self.path}': {e}")
+
+    def play(self):
+
+        if not self._loaded_ok:
+            return
+
+        pygame.mixer.music.play()
+
+        self._play_start_time = time.time()
+        self._paused_position = 0.0
+
+    def stop(self):
+
+        if not self._loaded_ok:
+            return
+
+        pygame.mixer.music.stop()
+
+        self._play_start_time = None
+
+    def set_position_zero(self):
+        """Equivalent of QMediaPlayer.setPosition(0)."""
+
+        self._paused_position = 0.0
+        self._play_start_time = None
+
+    def position_seconds(self):
+        """How far into the song we are, in seconds."""
+
+        if self._play_start_time is None:
+            return self._paused_position
+
+        return time.time() - self._play_start_time
+
+    def is_finished(self):
+        """True once playback has ended and isn't restarting."""
+
+        if not self._loaded_ok:
+            # Nothing to play - treat as "finished" so the app
+            # doesn't hang forever waiting on audio that will
+            # never start.
+            return True
+
+        if self._play_start_time is None:
+            return False
+
+        return not pygame.mixer.music.get_busy()
+
+
+# ==========================================================
+# NOTE CLASS
+# ==========================================================
+
+class Note:
+
+    def __init__(self, text, x, y, side, type_speed, rise_speed):
+
+        self.text = text
+
+        # Text currently visible
+        self.displayed_text = ""
+
+        # Position
+        self.x = x
+        self.y = y
+
+        # LEFT or RIGHT
+        self.side = side
+
+        # Typewriter
+        self.char_index = 0
+
+        self.last_type_time = time.time()
+
+        # Individual typing speed
+        self.type_speed = type_speed
+
+        # Individual upward movement speed (pixels per tick)
+        self.rise_speed = rise_speed
+
+
+    # ======================================================
+    # TYPEWRITER EFFECT
+    # ======================================================
+
+    def type_text(self):
+
+        current_time = time.time()
+
+        if self.char_index < len(self.text):
+
+            if (
+                current_time - self.last_type_time
+                >= self.type_speed
+            ):
+
+                self.displayed_text += (
+                    self.text[self.char_index]
+                )
+
+                self.char_index += 1
+
+                self.last_type_time = current_time
+
+
+# ==========================================================
+# OVERLAY
+# ==========================================================
+
+class Overlay(QtWidgets.QWidget):
+
+    def __init__(self, lyrics, player):
+
+        super().__init__()
+
+        self.lyrics = lyrics
+
+        self.player = player
+
+        # Program start time
+        self.start_time = time.time()
+
+        # Next lyric to check
+        self.next_lyric_index = 0
+
+        # ==================================================
+        # ACTIVE NOTES
+        # ==================================================
+
+        self.notes = []
+
+        # ==================================================
+        # NEXT SIDE
+        # ==================================================
+
+        self.next_side_left = True
+
+        # ==================================================
+        # LAST NOTE ON EACH SIDE
+        # ==================================================
+
+        self.last_left_note = None
+        self.last_right_note = None
+
+        # ==================================================
+        # SCREEN SIZE
+        # ==================================================
+
+        screen = (
+            QtWidgets.QApplication
+            .primaryScreen()
+            .geometry()
+        )
+
+        self.screen_w = screen.width()
+        self.screen_h = screen.height()
+
+        # ==================================================
+        # NOTE POSITIONS
+        # ==================================================
+
+        self.left_x = (
+            SIDE_MARGIN +
+            NOTE_WIDTH // 2
+        )
+
+        self.right_x = (
+            self.screen_w -
+            SIDE_MARGIN -
+            NOTE_WIDTH // 2
+        )
+
+        # ==================================================
+        # WINDOW
+        # ==================================================
+
+        self.setGeometry(
+            0,
+            0,
+            self.screen_w,
+            self.screen_h
+        )
+
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            |
+            QtCore.Qt.WindowStaysOnTopHint
+            |
+            QtCore.Qt.Tool
+        )
+
+        # ==================================================
+        # TRANSPARENT BACKGROUND
+        # ==================================================
+
+        self.setAttribute(
+            QtCore.Qt.WA_TranslucentBackground,
+            True
+        )
+
+        # ==================================================
+        # CLICK THROUGH
+        # ==================================================
+
+        self.setAttribute(
+            QtCore.Qt.WA_TransparentForMouseEvents,
+            True
+        )
+
+        # ==================================================
+        # FONT
+        # ==================================================
+
+        self.font = QtGui.QFont(
+            "Sans",
+            22,
+            QtGui.QFont.Bold
+        )
+
+        # ==================================================
+        # LYRIC TIMER
+        # ==================================================
+
+        self.lyric_timer = QtCore.QTimer()
+
+        self.lyric_timer.timeout.connect(
+            self.check_lyrics
+        )
+
+        self.lyric_timer.start(
+            LYRIC_CHECK_MS
+        )
+
+        # ==================================================
+        # ANIMATION TIMER
+        # ==================================================
+
+        self.anim_timer = QtCore.QTimer()
+
+        self.anim_timer.timeout.connect(
+            self.animate_notes
+        )
+
+        self.anim_timer.start(
+            ANIM_INTERVAL_MS
+        )
+
+
+    # ==========================================================
+    # GET SONG TIME
+    # ==========================================================
+
+    def get_song_time(self):
+
+        return self.player.position_seconds()
+
+
+    # ==========================================================
+    # SPAWN NOTE
+    # ==========================================================
+
+    def spawn_note(
+        self,
+        text,
+        side,
+        type_speed,
+        rise_speed
+    ):
+
+        # ==================================================
+        # X POSITION
+        # ==================================================
+
+        if side == "left":
+
+            x = self.left_x
+
+        else:
+
+            x = self.right_x
+
+
+        # ==================================================
+        # START BELOW SCREEN
+        # ==================================================
+
+        start_y = (
+            self.screen_h +
+            NOTE_HEIGHT // 2
+        )
+
+
+        # ==================================================
+        # CREATE NOTE
+        # ==================================================
+
+        note = Note(
+            text,
+            x,
+            start_y,
+            side,
+            type_speed,
+            rise_speed
+        )
+
+
+        # ==================================================
+        # ADD NOTE
+        # ==================================================
+
+        self.notes.append(note)
+
+
+        # ==================================================
+        # SAVE LAST NOTE
+        # ==================================================
+
+        if side == "left":
+
+            self.last_left_note = note
+
+        else:
+
+            self.last_right_note = note
+
+
+    # ==========================================================
+    # CHECK IF NOTE CAN SPAWN
+    # ==========================================================
+
+    def side_is_clear(self, side):
+
+        if side == "left":
+
+            last = self.last_left_note
+
+        else:
+
+            last = self.last_right_note
+
+
+        if last is None:
+
+            return True
+
+
+        # Bottom of previous note
+        bottom = (
+            last.y +
+            NOTE_HEIGHT / 2
+        )
+
+
+        # Keep some distance
+        threshold = (
+            self.screen_h -
+            NOTE_GAP
+        )
+
+
+        if bottom > threshold:
+
+            return False
+
+
+        return True
+
+
+    # ==========================================================
+    # CHECK LYRICS
+    # ==========================================================
+
+    def check_lyrics(self):
+
+        song_time = self.get_song_time()
+
+
+        # ==================================================
+        # PROCESS LYRICS IN ORIGINAL ORDER
+        # ==================================================
+
+        while (
+            self.next_lyric_index
+            <
+            len(self.lyrics)
+        ):
+
+            # Current lyric
+            lyric_entry = self.lyrics[
+                self.next_lyric_index
+            ]
+
+            type_speed = lyric_entry[0]
+
+            spawn_time = lyric_entry[1]
+
+            text = lyric_entry[2]
+
+            # RISE_SPEED is optional - fall back to the default
+            # if this lyric's tuple doesn't include a 4th value
+            if len(lyric_entry) >= 4:
+
+                rise_speed = lyric_entry[3]
+
+            else:
+
+                rise_speed = DEFAULT_NOTE_SPEED
+
+
+            # ==================================================
+            # NOT TIME YET
+            # ==================================================
+
+            if song_time < spawn_time:
+
+                break
+
+
+            # ==================================================
+            # EMPTY LYRIC
+            # ==================================================
+
+            if not text.strip():
+
+                self.next_lyric_index += 1
+
+                continue
+
+
+            # ==================================================
+            # ASSIGN SIDE
+            # ==================================================
+
+            if self.next_side_left:
+
+                side = "left"
+
+            else:
+
+                side = "right"
+
+
+            # ==================================================
+            # CHECK SIDE
+            # ==================================================
+
+            if not self.side_is_clear(side):
+
+                # Wait until this side is clear.
+                break
+
+
+            # ==================================================
+            # SPAWN
+            # ==================================================
+
+            self.spawn_note(
+                text,
+                side,
+                type_speed,
+                rise_speed
+            )
+
+
+            # ==================================================
+            # SWITCH SIDE
+            # ==================================================
+
+            self.next_side_left = (
+                not self.next_side_left
+            )
+
+
+            # ==================================================
+            # NEXT LYRIC
+            # ==================================================
+
+            self.next_lyric_index += 1
+
+
+    # ==========================================================
+    # ANIMATE NOTES
+    # ==========================================================
+
+    def animate_notes(self):
+
+        still_active = []
+
+
+        # ==================================================
+        # UPDATE ALL NOTES
+        # ==================================================
+
+        for note in self.notes:
+
+            # ==============================================
+            # TYPEWRITER
+            # ==============================================
+
+            note.type_text()
+
+
+            # ==============================================
+            # MOVE UP
+            # ==============================================
+
+            note.y -= note.rise_speed
+
+
+            # ==============================================
+            # KEEP ON SCREEN
+            # ==============================================
+
+            if (
+                note.y +
+                NOTE_HEIGHT / 2
+                > 0
+            ):
+
+                still_active.append(note)
+
+
+            else:
+
+                # ==========================================
+                # NOTE LEFT SCREEN
+                # ==========================================
+
+                if note is self.last_left_note:
+
+                    self.last_left_note = None
+
+
+                if note is self.last_right_note:
+
+                    self.last_right_note = None
+
+
+        # ==================================================
+        # UPDATE ACTIVE NOTES
+        # ==================================================
+
+        self.notes = still_active
+
+
+        # ==================================================
+        # CHECK FOR NEW LYRICS
+        # ==================================================
+
+        self.check_lyrics()
+
+
+        # ==================================================
+        # REDRAW
+        # ==================================================
+
+        self.update()
+
+
+        # ==================================================
+        # CHECK IF SONG FINISHED
+        # ==================================================
+
+        if (
+            self.next_lyric_index
+            >= len(self.lyrics)
+            and
+            not self.notes
+            and
+            self.player.is_finished()
+        ):
+
+            QtWidgets.QApplication.quit()
+
+
+    # ==========================================================
+    # DRAW NOTES
+    # ==========================================================
+
+    def paintEvent(self, event):
+
+        painter = QtGui.QPainter(self)
+
+        painter.setRenderHint(
+            QtGui.QPainter.Antialiasing
+        )
+
+        painter.setFont(self.font)
+
+
+        # ==================================================
+        # DRAW EVERY NOTE
+        # ==================================================
+
+        for note in self.notes:
+
+            # ==============================================
+            # RECTANGLE
+            # ==============================================
+
+            rect = QtCore.QRectF(
+
+                note.x -
+                NOTE_WIDTH / 2,
+
+                note.y -
+                NOTE_HEIGHT / 2,
+
+                NOTE_WIDTH,
+
+                NOTE_HEIGHT
+            )
+
+
+            # ==============================================
+            # WHITE SQUARE
+            # ==============================================
+
+            painter.setBrush(
+                QtGui.QColor(
+                    255,
+                    255,
+                    255,
+                    255
+                )
+            )
+
+
+            # ==============================================
+            # BLACK BORDER
+            # ==============================================
+
+            painter.setPen(
+                QtGui.QPen(
+                    QtGui.QColor(
+                        0,
+                        0,
+                        0
+                    ),
+                    2
+                )
+            )
+
+
+            # ==============================================
+            # DRAW CARD
+            # ==============================================
+
+            painter.drawRoundedRect(
+                rect,
+                CORNER_RADIUS,
+                CORNER_RADIUS
+            )
+
+
+            # ==============================================
+            # TEXT
+            # ==============================================
+
+            painter.setPen(
+                QtGui.QColor(
+                    0,
+                    0,
+                    0
+                )
+            )
+
+
+            painter.drawText(
+
+                rect.adjusted(
+                    20,
+                    10,
+                    -20,
+                    -10
+                ),
+
+                QtCore.Qt.AlignCenter
+                |
+                QtCore.Qt.TextWordWrap,
+
+                note.displayed_text
+            )
+
+
+    # ==========================================================
+    # KEYBOARD CONTROLS
+    # ==========================================================
+
+    def keyPressEvent(self, event):
+
+        # ==================================================
+        # ESC = QUIT
+        # ==================================================
+
+        if (
+            event.key()
+            ==
+            QtCore.Qt.Key_Escape
+        ):
+
+            self.player.stop()
+
+            QtWidgets.QApplication.quit()
+
+
+        # ==================================================
+        # SPACE = RESTART
+        # ==================================================
+
+        elif (
+            event.key()
+            ==
+            QtCore.Qt.Key_Space
+        ):
+
+            self.restart_song()
+
+
+    # ==========================================================
+    # RESTART
+    # ==========================================================
+
+    def restart_song(self):
+
+        # ==================================================
+        # STOP SONG
+        # ==================================================
+
+        self.player.stop()
+
+
+        # ==================================================
+        # RESET SONG POSITION
+        # ==================================================
+
+        self.player.set_position_zero()
+
+
+        # ==================================================
+        # RESET LYRIC INDEX
+        # ==================================================
+
+        self.next_lyric_index = 0
+
+
+        # ==================================================
+        # CLEAR NOTES
+        # ==================================================
+
+        self.notes = []
+
+
+        # ==================================================
+        # RESET SIDES
+        # ==================================================
+
+        self.next_side_left = True
+
+
+        # ==================================================
+        # RESET LAST NOTES
+        # ==================================================
+
+        self.last_left_note = None
+
+        self.last_right_note = None
+
+
+        # ==================================================
+        # START SONG
+        # ==================================================
+
+        self.player.play()
+
+
+        # ==================================================
+        # REDRAW
+        # ==================================================
+
+        self.update()
+
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
+def main():
+
+    # ======================================================
+    # CREATE APPLICATION
+    # ======================================================
+
+    app = QtWidgets.QApplication(
+        sys.argv
+    )
+
+
+    # ======================================================
+    # CREATE MUSIC PLAYER
+    # ======================================================
+
+    player = AudioPlayer(SONG_PATH)
+
+
+    # ======================================================
+    # CREATE OVERLAY
+    # ======================================================
+
+    overlay = Overlay(
+        LYRICS,
+        player
+    )
+
+
+    # ======================================================
+    # FULLSCREEN
+    # ======================================================
+
+    overlay.showFullScreen()
+
+
+    # ======================================================
+    # KEYBOARD FOCUS
+    # ======================================================
+
+    overlay.setFocus()
+
+
+    # ======================================================
+    # PLAY SONG
+    # ======================================================
+
+    player.play()
+
+
+    # ======================================================
+    # RUN
+    # ======================================================
+
+    sys.exit(
+        app.exec_()
+    )
+
+
+# ==========================================================
+# START
+# ==========================================================
+
+if __name__ == "__main__":
+
+    main()
